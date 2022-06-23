@@ -1,5 +1,5 @@
 import argparse
-
+import distutils.util
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -78,7 +78,7 @@ def parse_args():
         "--seed", type=int, default=42, help="random seed for initialization")
     parser.add_argument(
         '--device',
-        choices=['cpu', 'gpu'],
+        choices=['cpu', 'gpu', 'mlu'],
         default="gpu",
         help="Select which device to train model, defaults to gpu.")
     parser.add_argument(
@@ -119,5 +119,20 @@ def parse_args():
         "--do_train", action='store_true', help="Whether to train the model.")
     parser.add_argument(
         "--do_predict", action='store_true', help="Whether to predict.")
+    parser.add_argument(
+        "--use_profiler",
+        type=distutils.util.strtobool,
+        default=False,
+        help="Enable training with profiler.")
+    parser.add_argument(
+        "--use_amp",
+        type=distutils.util.strtobool,
+        default=False,
+        help="Enable mixed precision training.")
+    parser.add_argument(
+        "--scale_loss",
+        type=float,
+        default=2**15,
+        help="The value of scale_loss for fp16.")
     args = parser.parse_args()
     return args

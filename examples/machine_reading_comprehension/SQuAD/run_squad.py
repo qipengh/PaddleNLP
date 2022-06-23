@@ -33,6 +33,8 @@ from paddlenlp.transformers import BertForQuestionAnswering, BertTokenizer, Erni
 from paddlenlp.transformers import LinearDecayWithWarmup
 from paddlenlp.metrics.squad import squad_evaluate, compute_prediction
 from datasets import load_dataset
+from sched import scheduler
+import paddle.profiler as profiler
 
 MODEL_CLASSES = {
     "bert": (BertForQuestionAnswering, BertTokenizer),
@@ -275,6 +277,9 @@ def run(args):
         num_train_epochs = math.ceil(num_training_steps /
                                      len(train_data_loader))
 
+        print("-- tran_steps:{}, max_steps: {}, load:{}, epochs:{} {} --".format(
+                num_training_steps, args.max_steps, len(train_data_loader), args.num_train_epochs, num_train_epochs))
+
         lr_scheduler = LinearDecayWithWarmup(
             args.learning_rate, num_training_steps, args.warmup_proportion)
 
@@ -292,28 +297,56 @@ def run(args):
             apply_decay_param_fun=lambda x: x in decay_params)
         criterion = CrossEntropyLossForSQuAD()
 
+        if args.use_profiler:
+            prof = profiler.Profiler(
+              targets=[profiler.ProfilerTarget.CPU, profiler.ProfilerTarget.MLU],
+              scheduler=(90, 95),
+              on_trace_ready=profiler.export_chrome_tracing('./profiler_bert_demo_mlu')
+            )
+            prof.start()
+
+        if args.use_amp:
+            scaler = paddle.amp.GradScaler(init_loss_scaling=args.scale_loss)
+
         global_step = 0
         tic_train = time.time()
 
         for epoch in range(num_train_epochs):
             for step, batch in enumerate(train_data_loader):
                 global_step += 1
-                logits = model(
-                    input_ids=batch['input_ids'],
-                    token_type_ids=batch['token_type_ids'],
-                    attention_mask=batch['attention_mask'])
-                loss = criterion(logits, (batch['start_positions'],
-                                          batch['end_positions']))
+                if args.use_amp:
+                    with paddle.amp.auto_cast(
+                            args.use_amp,
+                            custom_white_list=["layer_norm", "softmax", "gelu"]):
+                        logits = model(
+                            input_ids=batch['input_ids'],
+                            token_type_ids=batch['token_type_ids'],
+                            attention_mask=batch['attention_mask'])
+                        loss = criterion(logits, (batch['start_positions'],
+                                                  batch['end_positions']))
+                    scaler.scale(loss).backward()
+                    scaler.minimize(optimizer, loss)
+                else:
+                    logits = model(
+                        input_ids=batch['input_ids'],
+                        token_type_ids=batch['token_type_ids'],
+                        attention_mask=batch['attention_mask'])
+                    loss = criterion(logits, (batch['start_positions'],
+                                              batch['end_positions']))
+                    loss.backward()
+                    optimizer.step()
+                lr_scheduler.step()
+                optimizer.clear_grad()
+
+                if args.use_profiler:
+                    prof.step()
+
                 if global_step % args.logging_steps == 0:
                     print(
                         "global step %d, epoch: %d, batch: %d, loss: %f, speed: %.2f step/s"
                         % (global_step, epoch + 1, step + 1, loss,
                            args.logging_steps / (time.time() - tic_train)))
                     tic_train = time.time()
-                loss.backward()
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.clear_grad()
 
                 if global_step % args.save_steps == 0 or global_step == num_training_steps:
                     if rank == 0:
@@ -329,6 +362,10 @@ def run(args):
                         print('Saving checkpoint to:', output_dir)
                     if global_step == num_training_steps:
                         break
+
+        if args.use_profiler:
+            prof.stop()
+            # prof.summary(sorted_by=SortedKeys.CPUTotal, op_detail=True, thread_sep=False, time_unit='ms')
 
     if args.do_predict and rank == 0:
         dev_ds = dev_examples.map(partial(
